@@ -22,25 +22,20 @@
 //! use stable_vec::StableVec;
 //! ```
 
-#![deny(missing_debug_implementations)]
-
-extern crate bit_vec;
 #[cfg(test)]
 #[macro_use]
 extern crate quickcheck;
 
-use bit_vec::BitVec;
+#[macro_use]
+extern crate vob;
+use vob::{IterUnsetBits, Vob};
 
 use std::fmt;
+use std::io;
 use std::iter::FromIterator;
 use std::mem;
-use std::io;
 use std::ops::{Index, IndexMut};
 use std::ptr;
-
-#[cfg(test)]
-mod tests;
-
 
 /// A `Vec<T>`-like collection which guarantees stable indices and features
 /// O(1) deletion of elements.
@@ -164,7 +159,7 @@ pub struct StableVec<T> {
     data: Vec<T>,
 
     /// A flag for each element saying whether the element was removed.
-    deleted: BitVec,
+    deleted: Vob,
 
     /// A cached value equal to `self.deleted.iter().filter(|&b| !b).count()`
     used_count: usize,
@@ -177,7 +172,7 @@ impl<T> StableVec<T> {
     pub fn new() -> Self {
         Self {
             data: Vec::new(),
-            deleted: BitVec::new(),
+            deleted: Vob::new(),
             used_count: 0,
         }
     }
@@ -190,7 +185,7 @@ impl<T> StableVec<T> {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             data: Vec::with_capacity(capacity),
-            deleted: BitVec::with_capacity(capacity),
+            deleted: Vob::with_capacity(capacity),
             used_count: 0,
         }
     }
@@ -217,7 +212,7 @@ impl<T> StableVec<T> {
     pub fn from_vec(vec: Vec<T>) -> Self {
         Self {
             used_count: vec.len(),
-            deleted: BitVec::from_elem(vec.len(), false),
+            deleted: Vob::from_elem(vec.len(), false),
             data: vec,
         }
     }
@@ -268,7 +263,8 @@ impl<T> StableVec<T> {
     /// has a worst case time complexity of O(n). If you already know the
     /// index, use [`remove()`](#method.remove) instead.
     pub fn pop(&mut self) -> Option<T> {
-        let last_index = self.deleted
+        let last_index = self
+            .deleted
             .iter()
             .enumerate()
             .rev()
@@ -355,7 +351,7 @@ impl<T> StableVec<T> {
         let new_len = self.data.len() + count;
 
         unsafe {
-            self.deleted.grow(count, true);
+            self.deleted.resize(self.data.len() + count, true);
             self.data.set_len(new_len);
         }
     }
@@ -521,7 +517,7 @@ impl<T> StableVec<T> {
         // to be dropped are in the range 0..self.used_count.
         unsafe {
             self.data.set_len(self.used_count);
-            self.deleted.set_len(self.used_count);
+            self.deleted.truncate(self.used_count);
         }
     }
 
@@ -588,7 +584,7 @@ impl<T> StableVec<T> {
         // to be dropped are in the range 0..self.used_count.
         unsafe {
             self.data.set_len(self.used_count);
-            self.deleted.set_len(self.used_count);
+            self.deleted.truncate(self.used_count);
         }
     }
 
@@ -731,7 +727,10 @@ impl<T> StableVec<T> {
     /// }
     /// ```
     pub fn iter(&self) -> Iter<T> {
-        Iter { sv: self, pos: 0 }
+        Iter {
+            sv: self,
+            itr: self.deleted.iter_unset_bits(..),
+        }
     }
 
     /// Returns an iterator over mutable references to the existing elements
@@ -988,7 +987,7 @@ where
         let len = slice.as_ref().len();
         Self {
             data: slice.as_ref().into(),
-            deleted: BitVec::from_elem(len, false),
+            deleted: Vob::from_elem(len, false),
             used_count: len,
         }
     }
@@ -1002,7 +1001,7 @@ impl<T> FromIterator<T> for StableVec<T> {
         let data = Vec::from_iter(iter);
         Self {
             used_count: data.len(),
-            deleted: BitVec::from_elem(data.len(), false),
+            deleted: Vob::from_elem(data.len(), false),
             data,
         }
     }
@@ -1022,7 +1021,7 @@ impl<T> Extend<T> for StableVec<T> {
         self.data.extend(iter);
 
         let additional_count = self.data.len() - len_before;
-        self.deleted.grow(additional_count, false);
+        self.deleted.resize(additional_count, false);
         self.used_count += additional_count;
     }
 }
@@ -1040,7 +1039,9 @@ impl io::Write for StableVec<u8> {
         Ok(())
     }
 
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<'a, T> IntoIterator for &'a StableVec<T> {
@@ -1064,17 +1065,16 @@ impl<'a, T> IntoIterator for &'a mut StableVec<T> {
 /// Use the method [`StableVec::iter()`](struct.StableVec.html#method.iter) or
 /// the `IntoIterator` implementation of `&StableVec` to obtain an iterator
 /// of this kind.
-#[derive(Debug)]
+//#[derive(Debug)]
 pub struct Iter<'a, T: 'a> {
     sv: &'a StableVec<T>,
-    pos: usize,
+    itr: IterUnsetBits<'a, usize>,
 }
 
 impl<'a, T: 'a> Iterator for Iter<'a, T> {
     type Item = &'a T;
     fn next(&mut self) -> Option<Self::Item> {
-        next_valid_index(&mut self.pos, &self.sv.deleted)
-            .map(|i| &self.sv.data[i])
+        self.itr.next().map(|i| &self.sv.data[i])
     }
 }
 
@@ -1085,7 +1085,7 @@ impl<'a, T: 'a> Iterator for Iter<'a, T> {
 /// iterator of this kind.
 #[derive(Debug)]
 pub struct IterMut<'a, T: 'a> {
-    deleted: &'a mut BitVec,
+    deleted: &'a mut Vob,
     used_count: &'a mut usize,
     vec_iter: ::std::slice::IterMut<'a, T>,
     pos: usize,
@@ -1135,7 +1135,7 @@ impl<'a, T> Iterator for IterMut<'a, T> {
 /// obtain an iterator of this kind.
 #[derive(Debug)]
 pub struct Keys<'a> {
-    deleted: &'a BitVec,
+    deleted: &'a Vob,
     pos: usize,
 }
 
@@ -1155,7 +1155,7 @@ impl<'a> Iterator for Keys<'a> {
 ///
 /// - `i + 1` if `Some(i)` was returned
 /// - `deleted.len()` if `None` was returned
-fn next_valid_index(pos: &mut usize, deleted: &BitVec) -> Option<usize> {
+fn next_valid_index(pos: &mut usize, deleted: &Vob) -> Option<usize> {
     // First, we advance until we have found an existing element or until
     // we have reached the end of all elements.
     while *pos < deleted.len() && deleted[*pos] {
